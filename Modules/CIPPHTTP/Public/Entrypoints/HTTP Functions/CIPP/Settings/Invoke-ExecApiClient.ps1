@@ -165,7 +165,7 @@ function Invoke-ExecApiClient {
                 if ([bool]($Request.Body.MCPAllowed ?? $false)) {
                     try {
                         $null = Set-CIPPMCPClientApp -AppId $ClientId -Headers $Request.Headers
-                        $Results.Add('MCP resource URIs and v2 tokens configured on the app registration. Run Save to Azure to apply the changes.')
+                        $Results.Add('MCP resource URIs, v2 tokens, and callbacks for known MCP clients (Claude, ChatGPT, VS Code, Copilot) configured on the app registration. Run Save to Azure to apply the changes.')
                     } catch {
                         $Results.Add(@{
                                 resultText = "Client saved, but MCP app configuration failed: $($_.Exception.Message)"
@@ -193,19 +193,9 @@ function Invoke-ExecApiClient {
             }
         }
         'GetAzureConfiguration' {
-            if ($env:WEBSITE_RESOURCE_GROUP) {
-                $RGName = $env:WEBSITE_RESOURCE_GROUP
-            } else {
-                $Owner = $env:WEBSITE_OWNER_NAME
-                if ($env:WEBSITE_SKU -ne 'FlexConsumption' -and $Owner -match '^(?<SubscriptionId>[^+]+)\+(?<RGName>[^-]+(?:-[^-]+)*?)(?:-[^-]+webspace(?:-Linux)?)?$') {
-                    $RGName = $Matches.RGName
-                } else {
-                    Write-Information "Could not determine resource group from environment variables. Owner: $Owner"
-                    $RGName = $null
-                }
-            }
             $FunctionAppName = $env:WEBSITE_SITE_NAME
             try {
+                $RGName = Get-CIPPFunctionAppResourceGroup -SiteName $FunctionAppName
                 $APIClients = Get-CippApiAuth -RGName $RGName -FunctionAppName $FunctionAppName
                 $Results = $ApiClients
             } catch {
@@ -220,17 +210,6 @@ function Invoke-ExecApiClient {
         }
         'SaveToAzure' {
             $TenantId = $env:TenantID
-            if ($env:WEBSITE_RESOURCE_GROUP) {
-                $RGName = $env:WEBSITE_RESOURCE_GROUP
-            } else {
-                $Owner = $env:WEBSITE_OWNER_NAME
-                if ($env:WEBSITE_SKU -ne 'FlexConsumption' -and $Owner -match '^(?<SubscriptionId>[^+]+)\+(?<RGName>[^-]+(?:-[^-]+)*?)(?:-[^-]+webspace(?:-Linux)?)?$') {
-                    $RGName = $Matches.RGName
-                } else {
-                    Write-Information "Could not determine resource group from environment variables. Owner: $Owner"
-                    $RGName = $null
-                }
-            }
             $FunctionAppName = $env:WEBSITE_SITE_NAME
             $AllClients = Get-CIPPAzDataTableEntity @Table -Filter 'Enabled eq true' | Where-Object { ![string]::IsNullOrEmpty($_.RowKey) }
             $ClientIds = $AllClients.RowKey
@@ -238,14 +217,38 @@ function Invoke-ExecApiClient {
             $McpClientIds = @($AllClients | Where-Object { "$($_.MCPAllowed)" -eq 'True' } | ForEach-Object { $_.RowKey })
             Write-Information "[ExecApiClient] MCP clients resolved for audiences/scope: $($McpClientIds -join ', ')"
             try {
+                $RGName = Get-CIPPFunctionAppResourceGroup -SiteName $FunctionAppName
                 Set-CippApiAuth -RGName $RGName -FunctionAppName $FunctionAppName -TenantId $TenantId -ClientIds $ClientIds -McpClientIds $McpClientIds
 
-                # Advertise the MCP resource scope via App Service PRM so the Claude connector requests
-                # a scope that matches the resource app (clears AADSTS9010010). Cleared when no MCP clients.
                 if ($McpClientIds.Count -gt 0 -and $env:WEBSITE_HOSTNAME) {
-                    $null = Update-CIPPAzFunctionAppSetting -Name $FunctionAppName -ResourceGroupName $RGName -AppSetting @{ 'WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES' = "https://$($env:WEBSITE_HOSTNAME)/user_impersonation" }
+                    if ($env:CIPPNG) {
+                        $TenantedLogin = "https://login.microsoftonline.com/$($env:TenantID)"
+                        $McpScope = "https://$($env:WEBSITE_HOSTNAME)/user_impersonation"
+                        $PrmDocument = [ordered]@{
+                            resource                 = '{origin}/api/ExecMcp'
+                            authorization_servers    = @('{origin}')
+                            scopes_supported         = @($McpScope)
+                            bearer_methods_supported = @('header')
+                        } | ConvertTo-Json -Compress
+                        $AsDocument = [ordered]@{
+                            issuer                                = '{origin}'
+                            authorization_endpoint                = "$TenantedLogin/oauth2/v2.0/authorize"
+                            token_endpoint                        = "$TenantedLogin/oauth2/v2.0/token"
+                            jwks_uri                              = "$TenantedLogin/discovery/v2.0/keys"
+                            registration_endpoint                 = '{origin}/api/PublicMcpRegister'
+                            response_types_supported              = @('code')
+                            response_modes_supported              = @('query', 'form_post')
+                            grant_types_supported                 = @('authorization_code', 'refresh_token')
+                            code_challenge_methods_supported      = @('S256')
+                            token_endpoint_auth_methods_supported = @('none', 'client_secret_post', 'client_secret_basic')
+                            scopes_supported                      = @('openid', 'profile', 'offline_access', $McpScope)
+                        } | ConvertTo-Json -Compress
+                        $null = Update-CIPPAzFunctionAppSetting -Name $FunctionAppName -ResourceGroupName $RGName -AppSetting @{ 'CRAFT_PRM' = "$PrmDocument"; 'CRAFT_PRM_AS' = "$AsDocument"; 'WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES' = $McpScope }
+                    } else {
+                        $null = Update-CIPPAzFunctionAppSetting -Name $FunctionAppName -ResourceGroupName $RGName -AppSetting @{ 'WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES' = "https://$($env:WEBSITE_HOSTNAME)/user_impersonation" }
+                    }
                 } else {
-                    $null = Update-CIPPAzFunctionAppSetting -Name $FunctionAppName -ResourceGroupName $RGName -AppSetting @{} -RemoveKeys @('WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES')
+                    $null = Update-CIPPAzFunctionAppSetting -Name $FunctionAppName -ResourceGroupName $RGName -AppSetting @{} -RemoveKeys @('WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES', 'CRAFT_PRM', 'CRAFT_PRM_AS')
                 }
 
                 $Body = @{ Results = 'API clients saved to Azure' }
@@ -356,7 +359,7 @@ function Invoke-ExecApiClient {
                     }
                     Write-Information "Deleting API Client: $ClientId from CIPP"
                     $Client = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq '$($ClientId)'" -Property RowKey, PartitionKey
-                    Remove-AzDataTableEntity @Table -Entity $Client -Force
+                    Remove-CIPPAzDataTableEntity @Table -Entity $Client -Force
                     Write-LogMessage -headers $Request.Headers -API 'ExecApiClient' -message "Deleted API client $ClientId" -Sev 'Info'
                     $Body = @{ Results = "API client $ClientId deleted" }
                 } else {
